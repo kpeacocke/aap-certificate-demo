@@ -1,0 +1,140 @@
+---
+- name: Discover and assess the live certificate
+  hosts: all
+  gather_facts: false
+
+  vars:
+    demo_hostname: web01.lab.test
+    demo_port: 443
+    renewal_threshold_days: 30
+
+  tasks:
+    - name: Read the certificate currently served by NGINX
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          timeout 10 openssl s_client \
+            -connect 127.0.0.1:{{ demo_port }} \
+            -servername {{ demo_hostname }} \
+            </dev/null 2>/dev/null |
+          openssl x509 \
+            -noout \
+            -subject \
+            -issuer \
+            -serial \
+            -startdate \
+            -enddate \
+            -fingerprint \
+            -sha256 \
+            -ext subjectAltName
+        executable: /bin/bash
+      register: live_certificate
+      changed_when: false
+
+    - name: Read the live certificate serial number
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          timeout 10 openssl s_client \
+            -connect 127.0.0.1:{{ demo_port }} \
+            -servername {{ demo_hostname }} \
+            </dev/null 2>/dev/null |
+          openssl x509 -noout -serial |
+          cut -d= -f2
+        executable: /bin/bash
+      register: certificate_serial
+      changed_when: false
+
+    - name: Read the live certificate expiry date
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          timeout 10 openssl s_client \
+            -connect 127.0.0.1:{{ demo_port }} \
+            -servername {{ demo_hostname }} \
+            </dev/null 2>/dev/null |
+          openssl x509 -noout -enddate |
+          cut -d= -f2-
+        executable: /bin/bash
+      register: certificate_expiry
+      changed_when: false
+
+    - name: Calculate remaining certificate validity
+      ansible.builtin.shell:
+        cmd: |
+          expiry_epoch=$(date -u -d "{{ certificate_expiry.stdout }}" +%s)
+          current_epoch=$(date -u +%s)
+          remaining_seconds=$((expiry_epoch - current_epoch))
+
+          if [ "${remaining_seconds}" -le 0 ]; then
+            echo 0
+          else
+            echo $(((remaining_seconds + 86399) / 86400))
+          fi
+        executable: /bin/bash
+      register: certificate_days_remaining
+      changed_when: false
+
+    - name: Check whether the certificate is inside the renewal threshold
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          timeout 10 openssl s_client \
+            -connect 127.0.0.1:{{ demo_port }} \
+            -servername {{ demo_hostname }} \
+            </dev/null 2>/dev/null |
+          openssl x509 \
+            -noout \
+            -checkend {{ renewal_threshold_days | int * 86400 }}
+        executable: /bin/bash
+      register: renewal_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check application health
+      ansible.builtin.uri:
+        url: "https://127.0.0.1/healthz"
+        headers:
+          Host: "{{ demo_hostname }}"
+        validate_certs: false
+        return_content: true
+        status_code: 200
+      register: application_health
+
+    - name: Set certificate assessment values
+      ansible.builtin.set_fact:
+        rotation_required: "{{ renewal_check.rc != 0 }}"
+        certificate_risk: >-
+          {{
+            'CRITICAL'
+            if certificate_days_remaining.stdout | int <= 1
+            else 'HIGH'
+            if certificate_days_remaining.stdout | int <= renewal_threshold_days
+            else 'LOW'
+          }}
+
+    - name: Present certificate assessment
+      ansible.builtin.debug:
+        msg:
+          - "CERTIFICATE ASSESSMENT"
+          - "----------------------"
+          - "Application:        Customer Portal"
+          - "Endpoint:           {{ demo_hostname }}:{{ demo_port }}"
+          - "Current serial:     {{ certificate_serial.stdout }}"
+          - "Expiry:             {{ certificate_expiry.stdout }}"
+          - "Days remaining:     {{ certificate_days_remaining.stdout }}"
+          - "Renewal threshold:  {{ renewal_threshold_days }} days"
+          - "Application health: HTTP {{ application_health.status }}"
+          - "Risk:               {{ certificate_risk }}"
+          - "Rotation required:  {{ 'YES' if rotation_required else 'NO' }}"
+
+    - name: Preserve discovery evidence for workflow jobs
+      ansible.builtin.set_stats:
+        data:
+          discovered_certificate_serial: "{{ certificate_serial.stdout }}"
+          discovered_certificate_expiry: "{{ certificate_expiry.stdout }}"
+          discovered_days_remaining: "{{ certificate_days_remaining.stdout | int }}"
+          rotation_required: "{{ rotation_required }}"
+          certificate_risk: "{{ certificate_risk }}"
+        aggregate: true
+        per_host: false
