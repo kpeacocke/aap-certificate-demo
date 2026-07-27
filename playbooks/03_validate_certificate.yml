@@ -89,16 +89,19 @@
     - name: Present live validation evidence
       ansible.builtin.debug:
         msg:
-          - "LIVE VALIDATION"
-          - "---------------"
-          - "Endpoint:             {{ demo_hostname }}:{{ demo_port }}"
-          - "Expected serial:      {{ replacement_certificate_serial | default(installed_certificate_serial) }}"
-          - "Externally observed:  {{ external_live_serial.stdout }}"
-          - "Serial match:         PASSED"
-          - "Hostname validation:  PASSED"
-          - "Application health:   HTTP {{ external_application_health.status }}"
-          - "Validation source:    AAP execution environment"
-          - "Result:               SUCCESS"
+          - "LIVE CERTIFICATE VALIDATION"
+          - "---------------------------"
+          - "Endpoint:              {{ demo_hostname }}:{{ demo_port }}"
+          - "Valid from:            {{ external_certificate_not_before }}"
+          - "Expires:               {{ external_certificate_not_after }}"
+          - "Days remaining:        {{ external_certificate_days_remaining }}"
+          - "Certificate serial:    {{ external_live_serial.stdout }}"
+          - "Expected serial:       {{ replacement_certificate_serial | default(installed_certificate_serial) }}"
+          - "Serial match:          PASSED"
+          - "Hostname validation:   PASSED"
+          - "Application health:    HTTP {{ external_application_health.status }}"
+          - "Observed from:         AAP execution environment"
+          - "Result:                CERTIFICATE VALID AND SERVICE HEALTHY"
 
     - name: Preserve validation evidence
       ansible.builtin.set_stats:
