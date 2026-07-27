@@ -1,0 +1,125 @@
+---
+- name: Reset the certificate demonstration
+  hosts: all
+  gather_facts: false
+  become: true
+
+  vars:
+    demo_hostname: web01.lab.test
+    demo_port: 443
+    certificate_path: /etc/pki/cert-demo/tls.crt
+    certificate_key_path: /etc/pki/cert-demo/tls.key
+    initial_validity_days: 5
+
+  tasks:
+    - name: Create a secure staging directory
+      ansible.builtin.tempfile:
+        state: directory
+        path: /etc/pki/cert-demo
+        prefix: reset-
+      register: reset_staging_directory
+
+    - name: Generate the initial five-day certificate
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -x509
+          - -newkey
+          - rsa:2048
+          - -sha256
+          - -nodes
+          - -days
+          - "{{ initial_validity_days | string }}"
+          - -keyout
+          - "{{ reset_staging_directory.path }}/tls.key"
+          - -out
+          - "{{ reset_staging_directory.path }}/tls.crt"
+          - -subj
+          - "/CN={{ demo_hostname }}/O=Red Hat Certificate Demo"
+          - -addext
+          - "subjectAltName=DNS:{{ demo_hostname }}"
+          - -addext
+          - "keyUsage=digitalSignature,keyEncipherment"
+          - -addext
+          - "extendedKeyUsage=serverAuth"
+      no_log: true
+
+    - name: Remove previous demonstration backups
+      ansible.builtin.file:
+        path: /var/backups/cert-demo
+        state: absent
+
+    - name: Recreate the backup root
+      ansible.builtin.file:
+        path: /var/backups/cert-demo
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Install the five-day certificate
+      ansible.builtin.copy:
+        src: "{{ reset_staging_directory.path }}/tls.crt"
+        dest: "{{ certificate_path }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Install the five-day private key
+      ansible.builtin.copy:
+        src: "{{ reset_staging_directory.path }}/tls.key"
+        dest: "{{ certificate_key_path }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Restore SELinux labels
+      ansible.builtin.command:
+        cmd: restorecon -RF /etc/pki/cert-demo
+      changed_when: false
+
+    - name: Validate the NGINX configuration
+      ansible.builtin.command:
+        cmd: /usr/sbin/nginx -t
+      changed_when: false
+
+    - name: Reload NGINX
+      ansible.builtin.systemd_service:
+        name: nginx
+        state: reloaded
+
+    - name: Remove the reset staging directory
+      ansible.builtin.file:
+        path: "{{ reset_staging_directory.path }}"
+        state: absent
+
+    - name: Read the reset certificate
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          timeout 10 openssl s_client \
+            -connect 127.0.0.1:{{ demo_port }} \
+            -servername {{ demo_hostname }} \
+            </dev/null 2>/dev/null |
+          openssl x509 \
+            -noout \
+            -subject \
+            -serial \
+            -dates \
+            -ext subjectAltName
+        executable: /bin/bash
+      register: reset_certificate
+      changed_when: false
+
+    - name: Present reset evidence
+      ansible.builtin.debug:
+        msg:
+          - "DEMO RESET COMPLETE"
+          - "-------------------"
+          - "Endpoint:       {{ demo_hostname }}:{{ demo_port }}"
+          - "Validity:       {{ initial_validity_days }} days"
+          - "{{ reset_certificate.stdout_lines }}"

@@ -1,0 +1,174 @@
+---
+- name: Roll back the Customer Portal certificate
+  hosts: all
+  gather_facts: false
+  become: true
+
+  vars:
+    demo_hostname: web01.lab.test
+    demo_port: 443
+    certificate_path: /etc/pki/cert-demo/tls.crt
+    certificate_key_path: /etc/pki/cert-demo/tls.key
+    certificate_backup_root: /var/backups/cert-demo
+
+  tasks:
+    - name: Initialise the effective backup directory
+      ansible.builtin.set_fact:
+        effective_backup_dir: "{{ certificate_backup_dir | default('') }}"
+
+    - name: Locate the newest backup when no workflow artifact is available
+      ansible.builtin.shell:
+        cmd: |
+          find /var/backups/cert-demo \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -printf '%T@ %p\n' |
+          sort -nr |
+          head -1 |
+          cut -d' ' -f2-
+        executable: /bin/bash
+      register: newest_backup
+      changed_when: false
+      failed_when: newest_backup.stdout | length == 0
+      when: effective_backup_dir | length == 0
+
+    - name: Use the newest available backup
+      ansible.builtin.set_fact:
+        effective_backup_dir: "{{ newest_backup.stdout }}"
+      when: effective_backup_dir | length == 0
+
+    - name: Confirm that the backup certificate exists
+      ansible.builtin.stat:
+        path: "{{ effective_backup_dir }}/tls.crt"
+      register: backup_certificate_file
+
+    - name: Confirm that the backup private key exists
+      ansible.builtin.stat:
+        path: "{{ effective_backup_dir }}/tls.key"
+      register: backup_private_key_file
+
+    - name: Validate rollback prerequisites
+      ansible.builtin.assert:
+        that:
+          - backup_certificate_file.stat.exists
+          - backup_private_key_file.stat.exists
+        fail_msg: "Rollback files are missing from {{ effective_backup_dir }}."
+
+    - name: Read the currently served serial
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          timeout 10 openssl s_client \
+            -connect 127.0.0.1:{{ demo_port }} \
+            -servername {{ demo_hostname }} \
+            </dev/null 2>/dev/null |
+          openssl x509 -noout -serial |
+          cut -d= -f2
+        executable: /bin/bash
+      register: pre_rollback_serial
+      changed_when: false
+
+    - name: Read the backup certificate serial
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - x509
+          - -in
+          - "{{ effective_backup_dir }}/tls.crt"
+          - -noout
+          - -serial
+      register: backup_serial_result
+      changed_when: false
+
+    - name: Record the backup serial
+      ansible.builtin.set_fact:
+        backup_certificate_serial: >-
+          {{ backup_serial_result.stdout | regex_replace('^serial=', '') }}
+
+    - name: Restore the previous certificate
+      ansible.builtin.copy:
+        src: "{{ effective_backup_dir }}/tls.crt"
+        dest: "{{ certificate_path }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Restore the previous private key
+      ansible.builtin.copy:
+        src: "{{ effective_backup_dir }}/tls.key"
+        dest: "{{ certificate_key_path }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Restore SELinux labels
+      ansible.builtin.command:
+        cmd: restorecon -RF /etc/pki/cert-demo
+      changed_when: false
+
+    - name: Validate the restored NGINX configuration
+      ansible.builtin.command:
+        cmd: /usr/sbin/nginx -t
+      changed_when: false
+
+    - name: Reload NGINX
+      ansible.builtin.systemd_service:
+        name: nginx
+        state: reloaded
+
+    - name: Wait for HTTPS after rollback
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ demo_port }}"
+        timeout: 15
+
+    - name: Read the serial served after rollback
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          timeout 10 openssl s_client \
+            -connect 127.0.0.1:{{ demo_port }} \
+            -servername {{ demo_hostname }} \
+            </dev/null 2>/dev/null |
+          openssl x509 -noout -serial |
+          cut -d= -f2
+        executable: /bin/bash
+      register: rollback_live_serial
+      changed_when: false
+
+    - name: Validate the rollback result
+      ansible.builtin.assert:
+        that:
+          - rollback_live_serial.stdout == backup_certificate_serial
+          - >-
+            rollback_live_serial.stdout ==
+            (previous_certificate_serial |
+            default(backup_certificate_serial))
+        fail_msg: NGINX is not serving the restored certificate.
+        success_msg: The previous certificate has been restored.
+
+    - name: Check application health after rollback
+      ansible.builtin.uri:
+        url: https://127.0.0.1/healthz
+        headers:
+          Host: "{{ demo_hostname }}"
+        validate_certs: false
+        status_code: 200
+      register: rollback_application_health
+
+    - name: Present rollback evidence
+      ansible.builtin.debug:
+        msg:
+          - "AUTOMATED ROLLBACK"
+          - "------------------"
+          - "Endpoint:             {{ demo_hostname }}:{{ demo_port }}"
+          - "Rejected serial:      {{ pre_rollback_serial.stdout }}"
+          - "Restored serial:      {{ rollback_live_serial.stdout }}"
+          - "Backup source:        {{ effective_backup_dir }}"
+          - "NGINX configuration:  PASSED"
+          - "Application health:   HTTP {{ rollback_application_health.status }}"
+          - "Result:               SERVICE RECOVERED"

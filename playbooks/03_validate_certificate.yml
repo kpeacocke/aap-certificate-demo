@@ -1,0 +1,117 @@
+---
+- name: Validate the deployed certificate externally
+  hosts: all
+  gather_facts: false
+
+  vars:
+    demo_hostname: web01.lab.test
+    demo_address: 172.20.54.111
+    demo_port: 443
+    certificate_path: /etc/pki/cert-demo/tls.crt
+    simulate_validation_failure: false
+
+  tasks:
+    - name: Read the serial from the deployed certificate file
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - x509
+          - -in
+          - "{{ certificate_path }}"
+          - -noout
+          - -serial
+      register: installed_serial_result
+      changed_when: false
+
+    - name: Record the installed certificate serial
+      ansible.builtin.set_fact:
+        installed_certificate_serial: >-
+          {{ installed_serial_result.stdout | regex_replace('^serial=', '') }}
+
+    - name: Read the certificate served to the AAP execution environment
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          timeout 10 openssl s_client \
+            -connect {{ demo_address }}:{{ demo_port }} \
+            -servername {{ demo_hostname }} \
+            </dev/null 2>/dev/null |
+          openssl x509 -noout -serial |
+          cut -d= -f2
+        executable: /bin/bash
+      delegate_to: localhost
+      register: external_live_serial
+      changed_when: false
+
+    - name: Validate the externally served certificate hostname
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          timeout 10 openssl s_client \
+            -connect {{ demo_address }}:{{ demo_port }} \
+            -servername {{ demo_hostname }} \
+            </dev/null 2>/dev/null |
+          openssl x509 \
+            -noout \
+            -checkhost {{ demo_hostname }}
+        executable: /bin/bash
+      delegate_to: localhost
+      register: external_hostname_check
+      changed_when: false
+      failed_when: false
+
+    - name: Validate application health from the execution environment
+      ansible.builtin.uri:
+        url: "https://{{ demo_address }}:{{ demo_port }}/healthz"
+        headers:
+          Host: "{{ demo_hostname }}"
+        validate_certs: false
+        return_content: true
+        status_code: 200
+      delegate_to: localhost
+      register: external_application_health
+
+    - name: Validate the deployed service
+      ansible.builtin.assert:
+        that:
+          - external_live_serial.stdout == installed_certificate_serial
+          - external_hostname_check.rc == 0
+          - external_application_health.status == 200
+          - >-
+            (replacement_certificate_serial |
+            default(external_live_serial.stdout)) ==
+            external_live_serial.stdout
+        fail_msg: >-
+          Post-deployment validation failed. The certificate observed by the
+          AAP execution environment does not match the expected deployment.
+        success_msg: External certificate and application validation passed.
+
+    - name: Present live validation evidence
+      ansible.builtin.debug:
+        msg:
+          - "LIVE VALIDATION"
+          - "---------------"
+          - "Endpoint:             {{ demo_hostname }}:{{ demo_port }}"
+          - "Expected serial:      {{ replacement_certificate_serial | default(installed_certificate_serial) }}"
+          - "Externally observed:  {{ external_live_serial.stdout }}"
+          - "Serial match:         PASSED"
+          - "Hostname validation:  PASSED"
+          - "Application health:   HTTP {{ external_application_health.status }}"
+          - "Validation source:    AAP execution environment"
+          - "Result:               SUCCESS"
+
+    - name: Preserve validation evidence
+      ansible.builtin.set_stats:
+        data:
+          externally_observed_serial: "{{ external_live_serial.stdout }}"
+          external_validation_passed: true
+          external_application_status: "{{ external_application_health.status }}"
+        aggregate: true
+        per_host: false
+
+    - name: Simulate a post-deployment validation failure
+      ansible.builtin.fail:
+        msg: >-
+          Simulated validation failure requested. Starting the workflow
+          rollback path.
+      when: simulate_validation_failure | bool
