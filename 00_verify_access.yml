@@ -1,0 +1,51 @@
+---
+- name: Verify AAP access to the certificate host
+  hosts: all
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Read the managed host name
+      ansible.builtin.command:
+        cmd: hostname -f
+      register: managed_hostname
+      changed_when: false
+
+    - name: Validate the NGINX configuration
+      ansible.builtin.command:
+        cmd: nginx -t
+      register: nginx_test
+      changed_when: false
+
+    - name: Check the application health endpoint
+      ansible.builtin.uri:
+        url: https://127.0.0.1/healthz
+        validate_certs: false
+        return_content: true
+        status_code: 200
+      register: application_health
+
+    - name: Read the installed certificate
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - x509
+          - -in
+          - /etc/pki/cert-demo/tls.crt
+          - -noout
+          - -subject
+          - -serial
+          - -dates
+          - -ext
+          - subjectAltName
+      register: certificate_details
+      changed_when: false
+
+    - name: Present verification evidence
+      ansible.builtin.debug:
+        msg:
+          - "Managed host: {{ managed_hostname.stdout }}"
+          - "NGINX configuration: passed"
+          - "Application health: HTTP {{ application_health.status }}"
+          - "{{ certificate_details.stdout_lines }}"
+'@ | Set-Content .\playbooks\00_verify_access.yml
