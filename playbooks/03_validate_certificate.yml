@@ -43,6 +43,57 @@
       register: external_live_serial
       changed_when: false
 
+    - name: Read the externally served certificate validity
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+
+          certificate_dates="$(
+            timeout 10 openssl s_client \
+              -connect {{ demo_address }}:{{ demo_port }} \
+              -servername {{ demo_hostname }} \
+              </dev/null 2>/dev/null |
+            openssl x509 -noout -startdate -enddate
+          )"
+
+          not_before="$(
+            printf '%s\n' "${certificate_dates}" |
+            sed -n 's/^notBefore=//p'
+          )"
+
+          not_after="$(
+            printf '%s\n' "${certificate_dates}" |
+            sed -n 's/^notAfter=//p'
+          )"
+
+          expiry_epoch=$(date -u -d "${not_after}" +%s)
+          current_epoch=$(date -u +%s)
+          remaining_seconds=$((expiry_epoch - current_epoch))
+
+          if [ "${remaining_seconds}" -le 0 ]; then
+            days_remaining=0
+          else
+            days_remaining=$(((remaining_seconds + 86399) / 86400))
+          fi
+
+          printf '%s\n%s\n%s\n' \
+            "${not_before}" \
+            "${not_after}" \
+            "${days_remaining}"
+        executable: /bin/bash
+      delegate_to: localhost
+      register: external_certificate_validity
+      changed_when: false
+
+    - name: Record the externally served certificate validity
+      ansible.builtin.set_fact:
+        external_certificate_not_before: >-
+          {{ external_certificate_validity.stdout_lines[0] }}
+        external_certificate_not_after: >-
+          {{ external_certificate_validity.stdout_lines[1] }}
+        external_certificate_days_remaining: >-
+          {{ external_certificate_validity.stdout_lines[2] | int }}
+
     - name: Validate the externally served certificate hostname
       ansible.builtin.shell:
         cmd: |
@@ -77,13 +128,15 @@
           - external_live_serial.stdout == installed_certificate_serial
           - external_hostname_check.rc == 0
           - external_application_health.status == 200
+          - external_certificate_days_remaining | int > 0
           - >-
             (replacement_certificate_serial |
             default(external_live_serial.stdout)) ==
             external_live_serial.stdout
         fail_msg: >-
           Post-deployment validation failed. The certificate observed by the
-          AAP execution environment does not match the expected deployment.
+          AAP execution environment does not match the expected deployment,
+          is invalid, or the application is unhealthy.
         success_msg: External certificate and application validation passed.
 
     - name: Present live validation evidence
@@ -107,8 +160,15 @@
       ansible.builtin.set_stats:
         data:
           externally_observed_serial: "{{ external_live_serial.stdout }}"
+          external_certificate_not_before: >-
+            {{ external_certificate_not_before }}
+          external_certificate_not_after: >-
+            {{ external_certificate_not_after }}
+          external_certificate_days_remaining: >-
+            {{ external_certificate_days_remaining }}
           external_validation_passed: true
-          external_application_status: "{{ external_application_health.status }}"
+          external_application_status: >-
+            {{ external_application_health.status }}
         aggregate: true
         per_host: false
 
