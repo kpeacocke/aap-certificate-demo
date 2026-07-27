@@ -1,0 +1,337 @@
+---
+- name: Back up and rotate the Customer Portal certificate
+  hosts: all
+  gather_facts: false
+  become: true
+
+  vars:
+    demo_hostname: web01.lab.test
+    demo_port: 443
+    certificate_path: /etc/pki/cert-demo/tls.crt
+    certificate_key_path: /etc/pki/cert-demo/tls.key
+    certificate_backup_root: /var/backups/cert-demo
+    replacement_validity_days: 90
+
+  tasks:
+    - name: Read the currently served certificate serial
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          timeout 10 openssl s_client \
+            -connect 127.0.0.1:{{ demo_port }} \
+            -servername {{ demo_hostname }} \
+            </dev/null 2>/dev/null |
+          openssl x509 -noout -serial |
+          cut -d= -f2
+        executable: /bin/bash
+      register: previous_live_serial
+      changed_when: false
+
+    - name: Generate a unique rotation identifier
+      ansible.builtin.command:
+        cmd: date -u +%Y%m%dT%H%M%SZ
+      register: rotation_timestamp
+      changed_when: false
+
+    - name: Set rotation paths
+      ansible.builtin.set_fact:
+        rotation_id: "{{ rotation_timestamp.stdout }}"
+        certificate_backup_dir: >-
+          {{ certificate_backup_root }}/{{ rotation_timestamp.stdout }}
+
+    - name: Create the certificate backup directory
+      ansible.builtin.file:
+        path: "{{ certificate_backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Back up the existing certificate
+      ansible.builtin.copy:
+        src: "{{ certificate_path }}"
+        dest: "{{ certificate_backup_dir }}/tls.crt"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Back up the existing private key
+      ansible.builtin.copy:
+        src: "{{ certificate_key_path }}"
+        dest: "{{ certificate_backup_dir }}/tls.key"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Create a secure staging directory
+      ansible.builtin.tempfile:
+        state: directory
+        path: /etc/pki/cert-demo
+        prefix: staged-
+      register: staged_certificate_directory
+
+    - name: Generate the replacement certificate
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -x509
+          - -newkey
+          - rsa:2048
+          - -sha256
+          - -nodes
+          - -days
+          - "{{ replacement_validity_days | string }}"
+          - -keyout
+          - "{{ staged_certificate_directory.path }}/tls.key"
+          - -out
+          - "{{ staged_certificate_directory.path }}/tls.crt"
+          - -subj
+          - "/CN={{ demo_hostname }}/O=Red Hat Certificate Demo"
+          - -addext
+          - "subjectAltName=DNS:{{ demo_hostname }}"
+          - -addext
+          - "keyUsage=digitalSignature,keyEncipherment"
+          - -addext
+          - "extendedKeyUsage=serverAuth"
+      no_log: true
+
+    - name: Secure the staged private key
+      ansible.builtin.file:
+        path: "{{ staged_certificate_directory.path }}/tls.key"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Set staged certificate permissions
+      ansible.builtin.file:
+        path: "{{ staged_certificate_directory.path }}/tls.crt"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Verify the replacement certificate hostname
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - x509
+          - -in
+          - "{{ staged_certificate_directory.path }}/tls.crt"
+          - -noout
+          - -checkhost
+          - "{{ demo_hostname }}"
+      register: certificate_hostname_check
+      changed_when: false
+
+    - name: Verify that the replacement key matches the certificate
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+
+          certificate_key_hash=$(
+            openssl x509 \
+              -in "{{ staged_certificate_directory.path }}/tls.crt" \
+              -pubkey \
+              -noout |
+            openssl pkey \
+              -pubin \
+              -outform DER |
+            openssl sha256
+          )
+
+          private_key_hash=$(
+            openssl pkey \
+              -in "{{ staged_certificate_directory.path }}/tls.key" \
+              -pubout \
+              -outform DER |
+            openssl sha256
+          )
+
+          test "${certificate_key_hash}" = "${private_key_hash}"
+        executable: /bin/bash
+      changed_when: false
+      no_log: true
+
+    - name: Read the replacement certificate serial
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - x509
+          - -in
+          - "{{ staged_certificate_directory.path }}/tls.crt"
+          - -noout
+          - -serial
+      register: staged_serial_result
+      changed_when: false
+
+    - name: Record the expected replacement serial
+      ansible.builtin.set_fact:
+        replacement_certificate_serial: >-
+          {{ staged_serial_result.stdout | regex_replace('^serial=', '') }}
+
+    - name: Deploy the replacement certificate safely
+      block:
+        - name: Install the replacement certificate
+          ansible.builtin.copy:
+            src: "{{ staged_certificate_directory.path }}/tls.crt"
+            dest: "{{ certificate_path }}"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Install the replacement private key
+          ansible.builtin.copy:
+            src: "{{ staged_certificate_directory.path }}/tls.key"
+            dest: "{{ certificate_key_path }}"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0600"
+          no_log: true
+
+        - name: Restore certificate SELinux labels
+          ansible.builtin.command:
+            cmd: restorecon -RF /etc/pki/cert-demo
+          changed_when: false
+
+        - name: Validate the NGINX configuration
+          ansible.builtin.command:
+            cmd: /usr/sbin/nginx -t
+          register: nginx_configuration_test
+          changed_when: false
+
+        - name: Reload NGINX
+          ansible.builtin.systemd_service:
+            name: nginx
+            state: reloaded
+
+      rescue:
+        - name: Restore the previous certificate
+          ansible.builtin.copy:
+            src: "{{ certificate_backup_dir }}/tls.crt"
+            dest: "{{ certificate_path }}"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Restore the previous private key
+          ansible.builtin.copy:
+            src: "{{ certificate_backup_dir }}/tls.key"
+            dest: "{{ certificate_key_path }}"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0600"
+          no_log: true
+
+        - name: Restore SELinux labels after rollback
+          ansible.builtin.command:
+            cmd: restorecon -RF /etc/pki/cert-demo
+          changed_when: false
+
+        - name: Reload NGINX using the restored certificate
+          ansible.builtin.systemd_service:
+            name: nginx
+            state: reloaded
+
+        - name: Stop because certificate deployment failed
+          ansible.builtin.fail:
+            msg: >-
+              Certificate deployment failed. The previous certificate was
+              restored from {{ certificate_backup_dir }}.
+
+      always:
+        - name: Remove the staged certificate directory
+          ansible.builtin.file:
+            path: "{{ staged_certificate_directory.path }}"
+            state: absent
+
+    - name: Wait for the HTTPS listener after reload
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ demo_port }}"
+        timeout: 15
+
+    - name: Read the certificate serial now served by NGINX
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          timeout 10 openssl s_client \
+            -connect 127.0.0.1:{{ demo_port }} \
+            -servername {{ demo_hostname }} \
+            </dev/null 2>/dev/null |
+          openssl x509 -noout -serial |
+          cut -d= -f2
+        executable: /bin/bash
+      register: replacement_live_serial
+      changed_when: false
+
+    - name: Read the new live certificate expiry
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          timeout 10 openssl s_client \
+            -connect 127.0.0.1:{{ demo_port }} \
+            -servername {{ demo_hostname }} \
+            </dev/null 2>/dev/null |
+          openssl x509 -noout -enddate |
+          cut -d= -f2-
+        executable: /bin/bash
+      register: replacement_live_expiry
+      changed_when: false
+
+    - name: Verify the live certificate is the replacement
+      ansible.builtin.assert:
+        that:
+          - replacement_live_serial.stdout == replacement_certificate_serial
+          - replacement_live_serial.stdout != previous_live_serial.stdout
+        fail_msg: >-
+          NGINX is not serving the expected replacement certificate.
+          Expected {{ replacement_certificate_serial }}, but observed
+          {{ replacement_live_serial.stdout }}.
+        success_msg: NGINX is serving the replacement certificate.
+
+    - name: Check application health after rotation
+      ansible.builtin.uri:
+        url: https://127.0.0.1/healthz
+        headers:
+          Host: "{{ demo_hostname }}"
+        validate_certs: false
+        return_content: true
+        status_code: 200
+      register: application_health
+
+    - name: Present certificate deployment evidence
+      ansible.builtin.debug:
+        msg:
+          - "CERTIFICATE DEPLOYMENT"
+          - "----------------------"
+          - "Application:          Customer Portal"
+          - "Endpoint:             {{ demo_hostname }}:{{ demo_port }}"
+          - "Previous serial:      {{ previous_live_serial.stdout }}"
+          - "Replacement serial:   {{ replacement_live_serial.stdout }}"
+          - "Replacement expiry:   {{ replacement_live_expiry.stdout }}"
+          - "Validity requested:   {{ replacement_validity_days }} days"
+          - "Hostname validation:  PASSED"
+          - "Certificate/key match: PASSED"
+          - "NGINX configuration:  PASSED"
+          - "Application health:   HTTP {{ application_health.status }}"
+          - "Backup directory:     {{ certificate_backup_dir }}"
+          - "Result:               SUCCESS"
+
+    - name: Preserve rotation evidence for downstream workflow jobs
+      ansible.builtin.set_stats:
+        data:
+          previous_certificate_serial: "{{ previous_live_serial.stdout }}"
+          replacement_certificate_serial: "{{ replacement_live_serial.stdout }}"
+          replacement_certificate_expiry: "{{ replacement_live_expiry.stdout }}"
+          certificate_backup_dir: "{{ certificate_backup_dir }}"
+          rotation_id: "{{ rotation_id }}"
+          demo_hostname: "{{ demo_hostname }}"
+          demo_port: "{{ demo_port }}"
+        aggregate: true
+        per_host: false
