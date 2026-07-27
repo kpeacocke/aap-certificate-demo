@@ -13,7 +13,7 @@
 
     - name: Validate the NGINX configuration
       ansible.builtin.command:
-        cmd: nginx -t
+        cmd: /usr/sbin/nginx -t
       register: nginx_test
       changed_when: false
 
@@ -48,4 +48,3 @@
           - "NGINX configuration: passed"
           - "Application health: HTTP {{ application_health.status }}"
           - "{{ certificate_details.stdout_lines }}"
-'@ | Set-Content .\playbooks\00_verify_access.yml
