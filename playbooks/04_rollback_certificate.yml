@@ -92,7 +92,20 @@
             sed -n 's/^notAfter=//p'
           )"
 
-          printf '%s\n%s\n' "${not_before}" "${not_after}"
+          expiry_epoch=$(date -u -d "${not_after}" +%s)
+          current_epoch=$(date -u +%s)
+          remaining_seconds=$((expiry_epoch - current_epoch))
+
+          if [ "${remaining_seconds}" -le 0 ]; then
+            days_remaining=0
+          else
+            days_remaining=$(((remaining_seconds + 86399) / 86400))
+          fi
+
+          printf '%s\n%s\n%s\n' \
+            "${not_before}" \
+            "${not_after}" \
+            "${days_remaining}"
         executable: /bin/bash
       register: rejected_certificate_validity
       changed_when: false
@@ -215,6 +228,8 @@
           {{ rejected_certificate_validity.stdout_lines[0] }}
         rejected_certificate_not_after: >-
           {{ rejected_certificate_validity.stdout_lines[1] }}
+        rejected_certificate_days_remaining: >-
+          {{ rejected_certificate_validity.stdout_lines[2] | int }}
         restored_certificate_not_before: >-
           {{ restored_certificate_validity.stdout_lines[0] }}
         restored_certificate_not_after: >-
